@@ -68,11 +68,22 @@ jobs:
             -e 's/epoxy/ep082/g' \
             -e 's/Epoxy/Ep082/g'
 
+      - name: Patch build script for name modifications
+        working-directory: client
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Automatically finds whatever filename the script is searching for inside target 
+          # and replaces it with the newly generated ep082_client.wasm target name
+          if [ -f "build.sh" ]; then
+            sed -i -E 's/[a-zA-Z0-9_-]+_client\.wasm/ep082_client.wasm/g' build.sh
+            sed -i -E 's/epoxy_client/ep082_client/g' build.sh
+          fi
+
       - name: Install matching wasm-bindgen CLI if specified
         shell: bash
         run: |
           set -euo pipefail
-          # Check client directory first, fallback to root directory
           if [ -f "client/Cargo.lock" ]; then
             LOCKFILE="client/Cargo.lock"
           elif [ -f "Cargo.lock" ]; then
