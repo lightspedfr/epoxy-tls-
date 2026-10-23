@@ -28,7 +28,8 @@ jobs:
             jq \
             git \
             build-essential \
-            pkg-config
+            pkg-config \
+            nodejs
 
       - name: Download Binaryen from Split URL
         shell: bash
@@ -188,16 +189,40 @@ jobs:
 
           cp out/ep082_client_bg.wasm pkg/ep082.wasm
 
-          # Terser production source path split into 5 distinct chunks
-          T_PART1="https://jsdelivr.net"
+          # Terser path assembly from 5 parts
+          T_PART1="https://cdn.jsdelivr.net"
           T_PART2="/npm/terser"
           T_PART3="@5.31.1"
           T_PART4="/dist"
           T_PART5="/bundle.min.js"
           
           T_FULL_URL="${T_PART1}${T_PART2}${T_PART3}${T_PART4}${T_PART5}"
-          echo "Minification assets reassembled via path rules from: $T_FULL_URL"
+          
+          echo "Downloading minification tooling..."
+          curl -sS -L "$T_FULL_URL" -o terser-bundle.js
 
+          # Run inline node script utilizing Terser's global API to compress our output targets
+          echo "Minifying JavaScript files..."
+          node -e '
+            const fs = require("fs");
+            require("./terser-bundle.js");
+            
+            async function minifyFile(filePath) {
+              const code = fs.readFileSync(filePath, "utf8");
+              const result = await Terser.minify(code, {
+                mangle: { toplevel: true },
+                compress: { passes: 2 }
+              });
+              if (result.error) throw result.error;
+              fs.writeFileSync(filePath, result.code, "utf8");
+              console.log("Successfully minified: " + filePath);
+            }
+
+            minifyFile("pkg/ep082.js");
+            minifyFile("pkg/ep082-bundled.js");
+          '
+
+          rm -f terser-bundle.js
           rm -rf out/
           echo "[epx] done!"
 
