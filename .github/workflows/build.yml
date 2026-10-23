@@ -30,17 +30,15 @@ jobs:
             build-essential \
             pkg-config
 
-      - name: Install modern Binaryen (wasm-opt)
+      - name: Install exact compatible Binaryen (wasm-opt)
         shell: bash
         run: |
           set -euo pipefail
+          # Fetch modern binaryen release to support --signext-lowering flags
           TAG=$(curl -s https://github.com | jq -r .tag_name)
-          echo "Installing Binaryen version $TAG..."
-          
           curl -L "https://github.com{TAG}/binaryen-${TAG}-x86_64-linux.tar.gz" | tar -xz
           sudo cp "binaryen-${TAG}/bin/"* /usr/local/bin/
           sudo cp -r "binaryen-${TAG}/lib/"* /usr/local/lib/ || true
-          
           wasm-opt --version
 
       - name: Install Rust nightly and WebAssembly target
@@ -48,13 +46,15 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Install wasm-bindgen CLI
-        run: cargo install wasm-bindgen-cli --locked
+      - name: Install exact required wasm-bindgen CLI version
+        run: |
+          cargo install wasm-bindgen-cli --version "0.2.100" --locked --force
 
       - name: Rename epoxy source references to ep082
         shell: bash
         run: |
           set -euo pipefail
+          # Perform the replacements safely on sources, keeping package configuration keys separate
           git grep -Ilz -E 'epoxy|Epoxy' -- \
             '*.rs' \
             '*.js' \
@@ -77,64 +77,112 @@ jobs:
             -e 's/epoxy/ep082/g' \
             -e 's/Epoxy/Ep082/g'
 
-      - name: Install matching wasm-bindgen CLI if specified
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -f "client/Cargo.lock" ]; then
-            LOCKFILE="client/Cargo.lock"
-          elif [ -f "Cargo.lock" ]; then
-            LOCKFILE="Cargo.lock"
-          else
-            echo "No Cargo.lock found."
-            exit 0
-          fi
-
-          VERSION="$(grep -A5 -E '^name = "wasm-bindgen"$' "$LOCKFILE" | grep -m1 '^version = ' | cut -d '"' -f2 || true)"
-          if [ -n "$VERSION" ]; then
-            echo "Using wasm-bindgen CLI version $VERSION from $LOCKFILE"
-            cargo install wasm-bindgen-cli \
-              --version "$VERSION" \
-              --locked \
-              --force
-          else
-            echo "No wasm-bindgen version found in $LOCKFILE."
-          fi
-
-      - name: Build WebAssembly package
+      - name: Compile and Bundle WebAssembly Package
         working-directory: client
         shell: bash
-        env:
-          # Force wasm-bindgen to use the specific custom updated path or skip internal version conflicts
-          WASM_BINDGEN_WASM_OPT: "/usr/local/bin/wasm-opt"
         run: |
           set -euo pipefail
-          chmod +x build.sh
+          shopt -s inherit_errexit
 
-          mkdir -p ../target/wasm32-unknown-unknown/release
-          echo "Compiling and ensuring target alignment..."
-          
-          bash build.sh || true
-          
-          TARGET_DIR="../target/wasm32-unknown-unknown/release"
-          FOUND_WASM=$(find "$TARGET_DIR" -maxdepth 1 -name "*.wasm" -not -name "ep082_client.wasm" -print -quit)
-          
-          if [ -n "$FOUND_WASM" ] && [ ! -f "$TARGET_DIR/ep082_client.wasm" ]; then
-             echo "Cargo generated: $FOUND_WASM. Linking to ep082_client.wasm for the build script tools."
-             cp "$FOUND_WASM" "$TARGET_DIR/ep082_client.wasm"
-             bash build.sh
+          mkdir -p out/
+          rm -rf pkg/
+          mkdir -p pkg/
+
+          MINIMAL="${MINIMAL:-0}"
+          RELEASE="${RELEASE:-0}"
+
+          if [ "$MINIMAL" = "1" ]; then
+            CARGOFLAGS="--no-default-features"
+          else
+            CARGOFLAGS=""
           fi
 
-          if [ ! -d pkg ]; then
-            echo "::error::Build did not create the pkg directory."
-            exit 1
+          export CFLAGS='-O3' RUSTFLAGS='-Zlocation-detail=none -C target-cpu=mvp --cfg getrandom_backend="wasm_js"'
+          
+          echo "Compiling via Cargo..."
+          cargo build --target wasm32-unknown-unknown -Z build-std=panic_abort,std -Z build-std-features=optimize_for_size --release $CARGOFLAGS
+
+          echo "[epx] cargo finished"
+          
+          # Run bindgen targeting your newly modified source definitions
+          wasm-bindgen --target web --out-dir out/ ../target/wasm32-unknown-unknown/release/ep082_client.wasm
+          echo "[epx] wasm-bindgen finished"
+
+          if [ "$RELEASE" != "1" ]; then
+            WASMOPTFLAGS="-g"
+          else
+            WASMOPTFLAGS=""
           fi
-          if [ -z "$(find pkg -type f -print -quit)" ]; then
-            echo "::error::The pkg directory is empty."
-            exit 1
+
+          mv out/ep082_client_bg.wasm out/ep082_client_unoptimized.wasm
+          wasm-opt $WASMOPTFLAGS --signext-lowering out/ep082_client_unoptimized.wasm -o out/ep082_client_lowered.wasm
+
+          if [ "$RELEASE" = "1" ]; then
+            G="--generate-global-effects"
+            time wasm-opt $WASMOPTFLAGS \
+              out/ep082_client_lowered.wasm -o out/ep082_client_bg.wasm \
+              --converge \
+              $G --type-unfinalizing $G --type-ssa $G -O4 $G --flatten $G --rereloop $G -O4 $G -O4 $G --type-merging $G --type-finalizing $G -O4 \
+              $G --type-unfinalizing $G --type-ssa $G -Oz $G --flatten $G --rereloop $G -Oz $G -Oz $G --type-merging $G --type-finalizing $G -Oz \
+              $G --abstract-type-refining $G --code-folding $G --const-hoisting $G --dae $G --flatten $G --dfo $G --merge-locals $G --merge-similar-functions --type-finalizing \
+              $G --type-unfinalizing $G --type-ssa $G -O4 $G --flatten $G --rereloop $G -O4 $G -O4 $G --type-merging $G --type-finalizing $G -O4 \
+              $G --type-unfinalizing $G --type-ssa $G -Oz $G --flatten $G --rereloop $G -Oz $G -Oz $G --type-merging $G --type-finalizing $G -Oz 
+          else
+            mv out/ep082_client_lowered.wasm out/ep082_client_bg.wasm
           fi
-          echo "Generated package:"
-          find pkg -maxdepth 3 -type f -print
+          echo "[epx] wasm-opt finished"
+
+          # === js transform framework ===
+          VERSION_VAL=$(jq -r '.version // "0.0.0"' package.json)
+          
+          AUTOGENERATED_INFO_FUNC="export const info = { version: \"$VERSION_VAL\", minimal: ${MINIMAL}===1, release: ${RELEASE}===1, commit: \"$(git rev-parse HEAD)\" };"
+          AUTOGENERATED_INFO_FUNC_TYPE="export const info: { version: string, minimal: boolean, release: boolean, commit: string };"
+
+          AUTOGENERATED_SOURCE=$(<"out/ep082_client.js")
+          AUTOGENERATED_SNIPPET_PATH=$(<"out/ep082_client.js")
+          
+          AUTOGENERATED_SNIPPET_PATH=${AUTOGENERATED_SNIPPET_PATH#*\'}
+          AUTOGENERATED_SNIPPET_PATH=${AUTOGENERATED_SNIPPET_PATH%%\'*}
+
+          AUTOGENERATED_SNIPPET=$(base64 -w0 "${AUTOGENERATED_SNIPPET_PATH/#./out}")
+          AUTOGENERATED_SOURCE=${AUTOGENERATED_SOURCE//${AUTOGENERATED_SNIPPET_PATH}/data:text/javascript$';'base64,${AUTOGENERATED_SNIPPET}}
+
+          # Apply compatibility overrides
+          AUTOGENERATED_SOURCE=${AUTOGENERATED_SOURCE//maximum:16384,shared:true/maximum:/iPad|iPhone|iPod/.test(navigator.userAgent)?4096:8192,shared:true}
+          AUTOGENERATED_SOURCE=${AUTOGENERATED_SOURCE//'_bg.wasm'/'.wasm'}
+          AUTOGENERATED_SOURCE=${AUTOGENERATED_SOURCE//'ep082_client.wasm'/'ep082.wasm'}
+
+          AUTOGENERATED_SOURCE=${AUTOGENERATED_SOURCE//export $'{' initSync $'};\n'/}
+          AUTOGENERATED_SOURCE=${AUTOGENERATED_SOURCE//if (wasm !== undefined) return wasm/if (wasm !== undefined) return}
+          AUTOGENERATED_SOURCE=${AUTOGENERATED_SOURCE//return __wbg_finalize_init/__wbg_finalize_init}
+
+          echo "$AUTOGENERATED_SOURCE" > pkg/ep082.js
+          echo "$AUTOGENERATED_INFO_FUNC" >> pkg/ep082.js
+
+          WASM_BASE64=$(base64 -w0 out/ep082_client_bg.wasm)
+          AUTOGENERATED_SOURCE=${AUTOGENERATED_SOURCE//__wbg_init(module_or_path) \{/__wbg_init(module_or_path) \{$'\n\t'module_or_path = module_or_path || $'{};\n\t'module_or_path.module_or_path=Uint8Array.from(atob(\'$WASM_BASE64\'), c=>c.charCodeAt(0))}
+
+          echo "$AUTOGENERATED_SOURCE" > pkg/ep082-bundled.js
+          echo "$AUTOGENERATED_INFO_FUNC" >> pkg/ep082-bundled.js
+
+          # === types transform framework ===
+          AUTOGENERATED_TYPES=$(<"out/ep082_client.d.ts")
+          AUTOGENERATED_TYPES=${AUTOGENERATED_TYPES//$'\n'export interface InitOutput*InitOutput;$'\n'/}
+          AUTOGENERATED_TYPES=${AUTOGENERATED_TYPES//Promise<InitOutput>/Promise<void>}
+
+          echo "$AUTOGENERATED_TYPES" > pkg/ep082.d.ts
+          echo "$AUTOGENERATED_INFO_FUNC_TYPE" >> pkg/ep082.d.ts
+
+          AUTOGENERATED_TYPES=${AUTOGENERATED_TYPES//export type InitInput * WebAssembly.Module;/}
+          AUTOGENERATED_TYPES=${AUTOGENERATED_TYPES//(module_or_path$'?':*Promise<InitInput>):/():}
+          AUTOGENERATED_TYPES=${AUTOGENERATED_TYPES//If $'`'module_or_path* - Passing $'`'InitInput$'`' directly is deprecated./}
+
+          echo "$AUTOGENERATED_TYPES" > pkg/ep082-bundled.d.ts
+          echo "$AUTOGENERATED_INFO_FUNC_TYPE" >> pkg/ep082-bundled.d.ts
+
+          cp out/ep082_client_bg.wasm pkg/ep082.wasm
+          rm -rf out/
+          echo "[epx] done!"
 
       - name: Commit generated pkg directory
         shell: bash
@@ -144,7 +192,7 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
+            "41898282+github-actions[bot]@://github.com"
           
           git add -f client/pkg/
           
