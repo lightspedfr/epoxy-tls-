@@ -68,18 +68,6 @@ jobs:
             -e 's/epoxy/ep082/g' \
             -e 's/Epoxy/Ep082/g'
 
-      - name: Patch build script for name modifications
-        working-directory: client
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Automatically finds whatever filename the script is searching for inside target 
-          # and replaces it with the newly generated ep082_client.wasm target name
-          if [ -f "build.sh" ]; then
-            sed -i -E 's/[a-zA-Z0-9_-]+_client\.wasm/ep082_client.wasm/g' build.sh
-            sed -i -E 's/epoxy_client/ep082_client/g' build.sh
-          fi
-
       - name: Install matching wasm-bindgen CLI if specified
         shell: bash
         run: |
@@ -110,7 +98,29 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x build.sh
-          bash build.sh
+
+          # Inject an alias patch before running build.sh to ensure the file exists under the expected name
+          mkdir -p ../target/wasm32-unknown-unknown/release
+          
+          # Intercept the execution right after cargo build finishes by wrapping build.sh
+          # Or handle it gracefully if build.sh executes cargo inside it
+          echo "Compiling and ensuring target alignment..."
+          
+          # Run the build script
+          bash build.sh || true
+          
+          # Check what file Cargo actually produced in the target dir
+          TARGET_DIR="../target/wasm32-unknown-unknown/release"
+          FOUND_WASM=$(find "$TARGET_DIR" -maxdepth 1 -name "*.wasm" -not -name "ep082_client.wasm" -print -quit)
+          
+          if [ -n "$FOUND_WASM" ] && [ ! -f "$TARGET_DIR/ep082_client.wasm" ]; then
+             echo "Cargo generated: $FOUND_WASM. Linking to ep082_client.wasm for the build script tools."
+             cp "$FOUND_WASM" "$TARGET_DIR/ep082_client.wasm"
+             
+             # Re-run build.sh now that the name match is guaranteed
+             bash build.sh
+          fi
+
           if [ ! -d pkg ]; then
             echo "::error::Build did not create the pkg directory."
             exit 1
