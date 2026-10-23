@@ -27,9 +27,21 @@ jobs:
           sudo apt-get install -y \
             jq \
             git \
-            binaryen \
             build-essential \
             pkg-config
+
+      - name: Install modern Binaryen (wasm-opt)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=$(curl -s https://github.com | jq -r .tag_name)
+          echo "Installing Binaryen version $TAG..."
+          
+          curl -L "https://github.com{TAG}/binaryen-${TAG}-x86_64-linux.tar.gz" | tar -xz
+          sudo cp "binaryen-${TAG}/bin/"* /usr/local/bin/
+          sudo cp -r "binaryen-${TAG}/lib/"* /usr/local/lib/ || true
+          
+          wasm-opt --version
 
       - name: Install Rust nightly and WebAssembly target
         uses: dtolnay/rust-toolchain@nightly
@@ -43,9 +55,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Rename lowercase and capitalized source references.
-          # Exclude Cargo manifests and lockfiles to preserve
-          # external dependency names and dependency resolution.
           git grep -Ilz -E 'epoxy|Epoxy' -- \
             '*.rs' \
             '*.js' \
@@ -96,28 +105,23 @@ jobs:
         working-directory: client
         shell: bash
         env:
-          WASM_BINDGEN_NO_WASM_OPT: 1
+          # Force wasm-bindgen to use the specific custom updated path or skip internal version conflicts
+          WASM_BINDGEN_WASM_OPT: "/usr/local/bin/wasm-opt"
         run: |
           set -euo pipefail
           chmod +x build.sh
 
-          # Inject an alias patch before running build.sh to ensure the file exists under the expected name
           mkdir -p ../target/wasm32-unknown-unknown/release
-          
           echo "Compiling and ensuring target alignment..."
           
-          # Run the build script
           bash build.sh || true
           
-          # Check what file Cargo actually produced in the target dir
           TARGET_DIR="../target/wasm32-unknown-unknown/release"
           FOUND_WASM=$(find "$TARGET_DIR" -maxdepth 1 -name "*.wasm" -not -name "ep082_client.wasm" -print -quit)
           
           if [ -n "$FOUND_WASM" ] && [ ! -f "$TARGET_DIR/ep082_client.wasm" ]; then
              echo "Cargo generated: $FOUND_WASM. Linking to ep082_client.wasm for the build script tools."
              cp "$FOUND_WASM" "$TARGET_DIR/ep082_client.wasm"
-             
-             # Re-run build.sh now that the name match is guaranteed
              bash build.sh
           fi
 
