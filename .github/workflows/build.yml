@@ -4,6 +4,15 @@ on:
     branches:
       - "**"
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Run the full wasm-opt release pipeline (no debug info)"
+        type: boolean
+        default: false
+      minimal:
+        description: "Build with --no-default-features"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -11,6 +20,11 @@ permissions:
 concurrency:
   group: ep082-build-${{ github.ref }}
   cancel-in-progress: false
+
+# Shared by both jobs so the compile and bundle steps always agree.
+env:
+  RELEASE: ${{ (github.event_name == 'workflow_dispatch' && inputs.release) && '1' || '0' }}
+  MINIMAL: ${{ (github.event_name == 'workflow_dispatch' && inputs.minimal) && '1' || '0' }}
 
 jobs:
   # ==========================================
@@ -21,22 +35,37 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git build-essential pkg-config
+          sudo apt-get install -y jq build-essential pkg-config
 
       - name: Install Rust nightly and WebAssembly target
         uses: dtolnay/rust-toolchain@nightly
         with:
           targets: wasm32-unknown-unknown
+          # -Z build-std needs the standard library sources
+          components: rust-src
 
-      - name: Install exact required wasm-bindgen CLI version
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-bindgen CLI matching Cargo.lock
+        shell: bash
         run: |
-          cargo install wasm-bindgen-cli --version "0.2.100" --locked --force
+          set -euo pipefail
+          LOCKFILE=$(cargo locate-project --workspace --message-format plain --manifest-path client/Cargo.toml)
+          LOCKFILE="$(dirname "$LOCKFILE")/Cargo.lock"
+          WBG_VERSION=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' "$LOCKFILE")
+          if [ -z "$WBG_VERSION" ]; then
+            echo "Could not find wasm-bindgen in $LOCKFILE" >&2
+            exit 1
+          fi
+          echo "Installing wasm-bindgen-cli $WBG_VERSION"
+          if ! command -v wasm-bindgen >/dev/null || [ "$(wasm-bindgen --version | awk '{print $2}')" != "$WBG_VERSION" ]; then
+            cargo install wasm-bindgen-cli --version "$WBG_VERSION" --locked --force
+          fi
 
       - name: Rename epoxy source references to ep082
         shell: bash
@@ -52,33 +81,40 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p out/
-          rm -rf pkg/
-          mkdir -p pkg/
-          
-          MINIMAL="${MINIMAL:-0}"
           CARGOFLAGS=""
           if [ "$MINIMAL" = "1" ]; then
             CARGOFLAGS="--no-default-features"
           fi
-          
+
           export CFLAGS='-O3' RUSTFLAGS='-Zlocation-detail=none -C target-cpu=mvp --cfg getrandom_backend="wasm_js"'
-          cargo build --target wasm32-unknown-unknown -Z build-std=panic_abort,std -Z build-std-features=optimize_for_size --release $CARGOFLAGS
+          cargo build --target wasm32-unknown-unknown \
+            -Z build-std=panic_abort,std -Z build-std-features=optimize_for_size \
+            --release $CARGOFLAGS
 
       - name: Wasm Bindgen Generation
         working-directory: client
         shell: bash
         run: |
           set -euo pipefail
-          wasm-bindgen --target web --out-dir out/ ../target/wasm32-unknown-unknown/release/ep082_client.wasm
+          # Cargo.toml is excluded from the rename, so the crate still builds under
+          # its original name. Look the real artifact up instead of guessing it.
+          META=$(cargo metadata --no-deps --format-version 1 --manifest-path Cargo.toml)
+          TARGET_DIR=$(jq -r '.target_directory' <<<"$META")
+          LIB_NAME=$(jq -r --arg mf "$PWD/Cargo.toml" '
+            .packages[] | select(.manifest_path == $mf)
+            | .targets[] | select(.kind | index("cdylib")) | .name' <<<"$META" | tr '-' '_')
+          WASM="$TARGET_DIR/wasm32-unknown-unknown/release/${LIB_NAME}.wasm"
+          echo "Using $WASM"
+
+          mkdir -p out/
+          wasm-bindgen --target web --out-dir out/ --out-name ep082_client "$WASM"
 
       - name: Upload Intermediates
         uses: actions/upload-artifact@v4
         with:
           name: compiled-wasm-assets
-          path: |
-            client/out/
-            client/package.json
+          path: client/out/
+          if-no-files-found: error
 
   # ==========================================
   # PART 2: OPTIMIZATION & METADATA TRANSFORM
@@ -92,25 +128,24 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq git
-
-      - name: Install latest compatible Binaryen (wasm-opt)
+      - name: Install latest Binaryen (wasm-opt)
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG=$(curl -s https://github.com | jq -r .tag_name)
-          curl -L "https://github.com{TAG}/binaryen-${TAG}-x86_64-linux.tar.gz" | tar -xz
-          sudo cp "binaryen-${TAG}/bin/"* /usr/local/bin/
-          sudo cp -r "binaryen-${TAG}/lib/"* /usr/local/lib/ || true
+          mkdir -p "$RUNNER_TEMP/binaryen"
+          gh release download --repo WebAssembly/binaryen \
+            --pattern 'binaryen-*-x86_64-linux.tar.gz' --output - \
+          | tar -xz -C "$RUNNER_TEMP/binaryen" --strip-components=1
+          echo "$RUNNER_TEMP/binaryen/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/binaryen/bin/wasm-opt" --version
 
       - name: Download Intermediates
         uses: actions/download-artifact@v4
         with:
           name: compiled-wasm-assets
-          path: client/
+          path: client/out/
 
       - name: Lowering and Optimization Cycles
         working-directory: client
@@ -118,16 +153,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p pkg/
-          
-          MINIMAL="${MINIMAL:-0}"
-          RELEASE="${RELEASE:-0}"
-          
+
           if [ "$RELEASE" != "1" ]; then
             WASMOPTFLAGS="-g"
           else
             WASMOPTFLAGS=""
           fi
-          
+
           mv out/ep082_client_bg.wasm out/ep082_client_unoptimized.wasm
           wasm-opt $WASMOPTFLAGS --signext-lowering out/ep082_client_unoptimized.wasm -o out/ep082_client_lowered.wasm
 
@@ -138,9 +170,9 @@ jobs:
               --converge \
               $G --type-unfinalizing $G --type-ssa $G -O4 $G --flatten $G --rereloop $G -O4 $G -O4 $G --type-merging $G --type-finalizing $G -O4 \
               $G --type-unfinalizing $G --type-ssa $G -Oz $G --flatten $G --rereloop $G -Oz $G -Oz $G --type-merging $G --type-finalizing $G -Oz \
-              $G --abstract-type-refining $G --code-folding $G --const-hoisting $G --dae $G --flatten $G --dfo $G --merge-locals $G --merge-similar-functions --type-finalizing \
+              $G --abstract-type-refining $G --code-folding $G --const-hoisting $G --dae $G --flatten $G --dfo $G --merge-locals $G --merge-similar-functions $G --type-finalizing \
               $G --type-unfinalizing $G --type-ssa $G -O4 $G --flatten $G --rereloop $G -O4 $G -O4 $G --type-merging $G --type-finalizing $G -O4 \
-              $G --type-unfinalizing $G --type-ssa $G -Oz $G --flatten $G --rereloop $G -Oz $G -Oz $G --type-merging $G --type-finalizing $G -Oz 
+              $G --type-unfinalizing $G --type-ssa $G -Oz $G --flatten $G --rereloop $G -Oz $G -Oz $G --type-merging $G --type-finalizing $G -Oz
           else
             mv out/ep082_client_lowered.wasm out/ep082_client_bg.wasm
           fi
@@ -150,16 +182,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          MINIMAL="${MINIMAL:-0}"
-          RELEASE="${RELEASE:-0}"
-          
+
           VERSION_VAL=$(jq -r '.version // "0.0.0"' package.json)
           AUTOGENERATED_INFO_FUNC="export const info = { version: \"$VERSION_VAL\", minimal: ${MINIMAL}===1, release: ${RELEASE}===1, commit: \"$(git rev-parse HEAD)\" };"
           AUTOGENERATED_INFO_FUNC_TYPE="export const info: { version: string, minimal: boolean, release: boolean, commit: string };"
 
           AUTOGENERATED_SOURCE=$(<"out/ep082_client.js")
           AUTOGENERATED_SNIPPET_PATH=$(<"out/ep082_client.js")
-          
+
           AUTOGENERATED_SNIPPET_PATH=${AUTOGENERATED_SNIPPET_PATH#*\'}
           AUTOGENERATED_SNIPPET_PATH=${AUTOGENERATED_SNIPPET_PATH%%\'*}
 
@@ -201,19 +231,24 @@ jobs:
           rm -rf out/
 
       - name: Commit distribution outputs
+        # A manual run from a tag has no branch to push to.
+        if: github.ref_type == 'branch'
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@://github.com"
-          
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add -f client/pkg/
-          
+
           if git diff --cached --quiet; then
             echo "No changes to pkg; skipping commit."
             exit 0
           fi
           git commit -m "Build ep082 WebAssembly package"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+          # The branch may have moved (including an earlier run's pkg commit)
+          # since checkout; replay onto the tip, keeping this run's pkg files.
+          git fetch origin "$GITHUB_REF_NAME"
+          git rebase -X theirs "origin/$GITHUB_REF_NAME"
+          git push origin "HEAD:refs/heads/${GITHUB_REF_NAME}"
