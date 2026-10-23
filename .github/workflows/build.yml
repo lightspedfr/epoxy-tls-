@@ -73,10 +73,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="$(grep -A5 -E '^name = "wasm-bindgen"$' Cargo.lock \
-            | grep -m1 '^version = ' \
-
-            | cut -d '"' -f2 || true)"
+          VERSION="$(grep -A5 -E '^name = "wasm-bindgen"$' Cargo.lock | grep -m1 '^version = ' | cut -d '"' -f2 || true)"
           if [ -n "$VERSION" ]; then
             echo "Using wasm-bindgen CLI version $VERSION"
             cargo install wasm-bindgen-cli \
@@ -113,9 +110,8 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
+            "41898282+github-actions[bot]@://github.com"
           
-          # Git add the package generated inside the client directory
           git add -f client/pkg/
           
           if git diff --cached --quiet; then
