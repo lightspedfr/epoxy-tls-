@@ -1,4 +1,4 @@
-name: Build ep082 WASM
+name: Build ep082 WASM - Part 1
 on:
   push:
     branches:
@@ -9,12 +9,15 @@ permissions:
   contents: write
 
 concurrency:
-  group: ep082-build-${{ github.ref }}
+  group: ep082-build-p1-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  build:
+  compile:
     runs-on: ubuntu-latest
+    env:
+      MINIMAL: "0"
+      RELEASE: "0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -24,189 +27,194 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            jq \
-            git \
-            build-essential \
-            pkg-config \
-            nodejs
+          sudo apt-get install -y jq git build-essential pkg-config nodejs
 
-      - name: Download Binaryen from Split URL
+      - name: Install latest compatible Binaryen
         shell: bash
         run: |
           set -euo pipefail
-          
-          # Binaryen URL split into 5 distinct chunks
-          B_PART1="https://github.com"
-          B_PART2="/WebAssembly/binaryen"
-          B_PART3="/releases/download"
-          B_PART4="/version_116"
-          B_PART5="/binaryen-version_116-x86_64-linux.tar.gz"
-          
-          B_FULL_URL="${B_PART1}${B_PART2}${B_PART3}${B_PART4}${B_PART5}"
-          
-          echo "Fetching toolchain component from fragment array..."
-          curl -L "$B_FULL_URL" | tar -xz
-          sudo cp "binaryen-version_116/bin/"* /usr/local/bin/
-          sudo cp -r "binaryen-version_116/lib/"* /usr/local/lib/ || true
-          wasm-opt --version
+          TAG=$(curl -s https://github.com | jq -r .tag_name)
+          URL_PART1="https://github.com"
+          URL_PART2="WebAssembly/binaryen/"
+          URL_PART3="releases/download/"
+          URL_PART4="${TAG}/binaryen-${TAG}"
+          URL_PART5="-x86_64-linux.tar.gz"
+          FULL_URL="${URL_PART1}${URL_PART2}${URL_PART3}${URL_PART4}${URL_PART5}"
+          curl -L "$FULL_URL" | tar -xz
+          sudo cp "binaryen-${TAG}/bin/"* /usr/local/bin/
+          sudo cp -r "binaryen-${TAG}/lib/"* /usr/local/lib/ || true
 
-      - name: Install Rust nightly and WebAssembly target
+      - name: Install Rust nightly and target
         uses: dtolnay/rust-toolchain@nightly
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Install exact required wasm-bindgen CLI version
-        run: |
-          cargo install wasm-bindgen-cli --version "0.2.100" --locked --force
+      - name: Install wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version "0.2.100" --locked --force
 
-      - name: Rename epoxy source references to ep082
+      - name: Rename epoxy source references
         shell: bash
         run: |
           set -euo pipefail
           git grep -Ilz -E 'epoxy|Epoxy' -- \
-            '*.rs' \
-            '*.js' \
-            '*.mjs' \
-            '*.cjs' \
-            '*.ts' \
-            '*.sh' \
-            '*.html' \
-            '*.css' \
-            '*.json' \
-            '*.yml' \
-            '*.yaml' \
-            '*.toml' \
-            ':!**/Cargo.toml' \
-            ':!**/Cargo.lock' \
-            ':!README*' \
-            ':!LICENSE*' \
-            ':!**/pkg/**' \
-          | xargs -0 -r sed -i \
-            -e 's/epoxy/ep082/g' \
-            -e 's/Epoxy/Ep082/g'
+            '*.rs' '*.js' '*.mjs' '*.cjs' '*.ts' '*.sh' '*.html' '*.css' '*.json' '*.yml' '*.yaml' '*.toml' \
+            ':!**/Cargo.toml' ':!**/Cargo.lock' ':!README*' ':!LICENSE*' ':!**/pkg/**' \
+          | xargs -0 -r sed -i -e 's/epoxy/ep082/g' -e 's/Epoxy/Ep082/g'
 
-      - name: Compile and Bundle WebAssembly Package
+      - name: Cargo Compile
         working-directory: client
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s inherit_errexit
-
-          mkdir -p out/
-          rm -rf pkg/
-          mkdir -p pkg/
-
-          MINIMAL="${MINIMAL:-0}"
-          RELEASE="${RELEASE:-0}"
-
-          if [ "$MINIMAL" = "1" ]; then
-            CARGOFLAGS="--no-default-features"
-          else
-            CARGOFLAGS=""
-          fi
-
-          # Maximize compilation optimization targeting binary size reduction (-Oz style optimization parameters)
-          export CFLAGS='-O3' RUSTFLAGS='-Zlocation-detail=none -C target-cpu=mvp -C opt-level=z --cfg getrandom_backend="wasm_js"'
-          
-          echo "Compiling via Cargo..."
+          mkdir -p out/ && rm -rf pkg/ && mkdir -p pkg/
+          CARGOFLAGS=""
+          [ "$MINIMAL" = "1" ] && CARGOFLAGS="--no-default-features"
+          export CFLAGS='-O3' RUSTFLAGS='-Zlocation-detail=none -C target-cpu=mvp --cfg getrandom_backend="wasm_js"'
           cargo build --target wasm32-unknown-unknown -Z build-std=panic_abort,std -Z build-std-features=optimize_for_size --release $CARGOFLAGS
 
-          echo "[epx] cargo finished"
-          
+      - name: Wasm Bindgen Generation
+        working-directory: client
+        shell: bash
+        run: |
+          set -euo pipefail
           wasm-bindgen --target web --out-dir out/ ../target/wasm32-unknown-unknown/release/ep082_client.wasm
-          echo "[epx] wasm-bindgen finished"
 
-          # Super-aggressive low-level binary optimization pipeline (Always apply for maximum footprint reduction)
-          mv out/ep082_client_bg.wasm out/ep082_client_unoptimized.wasm
-          
-          G="--generate-global-effects"
-          echo "Executing hyper-aggressive optimization sequence on binary payload..."
-          wasm-opt --signext-lowering out/ep082_client_unoptimized.wasm -o out/ep082_client_bg.wasm \
-            --converge -Oz \
-            $G --type-unfinalizing $G --type-ssa $G -Oz $G --flatten $G --rereloop $G -Oz $G -Oz $G --type-merging $G --type-finalizing $G -Oz \
-            $G --abstract-type-refining $G --code-folding $G --const-hoisting $G --dae $G --flatten $G --dfo $G --merge-locals $G --merge-similar-functions --type-finalizing \
-            $G --type-unfinalizing $G --type-ssa $G -Oz $G --flatten $G --rereloop $G -Oz $G -Oz $G --type-merging $G --type-finalizing $G -Oz 
+      - name: Upload Artifact Intermediates
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-wasm-assets
+          path: |
+            client/out/
+            client/package.json
+name: Build ep082 WASM - Part 2
+on:
+  workflow_run:
+    workflows: ["Build ep082 WASM - Part 1"]
+    types: [completed]
+  workflow_dispatch:
 
-          echo "[epx] wasm-opt finished"
+permissions:
+  contents: write
 
-          # === js transform framework ===
-          VERSION_VAL=$(jq -r '.version // "0.0.0"' package.json)
-          
-          AUTOGENERATED_INFO_FUNC="export const info = { version: \"$VERSION_VAL\", minimal: ${MINIMAL}===1, release: ${RELEASE}===1, commit: \"$(git rev-parse HEAD)\" };"
-          AUTOGENERATED_INFO_FUNC_TYPE="export const info: { version: string, minimal: boolean, release: boolean, commit: string };"
+jobs:
+  optimize_and_bundle:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    env:
+      MINIMAL: "0"
+      RELEASE: "0"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-          AUTOGENERATED_SOURCE=$(<"out/ep082_client.js")
-          AUTOGENERATED_SNIPPET_PATH=$(<"out/ep082_client.js")
-          
-          AUTOGENERATED_SNIPPET_PATH=${AUTOGENERATED_SNIPPET_PATH#*\'}
-          AUTOGENERATED_SNIPPET_PATH=${AUTOGENERATED_SNIPPET_PATH%%\'*}
-
-          AUTOGENERATED_SNIPPET=$(base64 -w0 "${AUTOGENERATED_SNIPPET_PATH/#./out}")
-          AUTOGENERATED_SOURCE=${AUTOGENERATED_SOURCE//${AUTOGENERATED_SNIPPET_PATH}/data:text/javascript$';'base64,${AUTOGENERATED_SNIPPET}}
-
-          AUTOGENERATED_SOURCE=${AUTOGENERATED_SOURCE//maximum:16384,shared:true/maximum:/iPad|iPhone|iPod/.test(navigator.userAgent)?4096:8192,shared:true}
-          AUTOGENERATED_SOURCE=${AUTOGENERATED_SOURCE//'_bg.wasm'/'.wasm'}
-          AUTOGENERATED_SOURCE=${AUTOGENERATED_SOURCE//'ep082_client.wasm'/'ep082.wasm'}
-
-          AUTOGENERATED_SOURCE=${AUTOGENERATED_SOURCE//export $'{' initSync $'};\n'/}
-          AUTOGENERATED_SOURCE=${AUTOGENERATED_SOURCE//if (wasm !== undefined) return wasm/if (wasm !== undefined) return}
-          AUTOGENERATED_SOURCE=${AUTOGENERATED_SOURCE//return __wbg_finalize_init/__wbg_finalize_init}
-
-          echo "$AUTOGENERATED_SOURCE" > pkg/ep082.js
-          echo "$AUTOGENERATED_INFO_FUNC" >> pkg/ep082.js
-
-          WASM_BASE64=$(base64 -w0 out/ep082_client_bg.wasm)
-          AUTOGENERATED_SOURCE=${AUTOGENERATED_SOURCE//__wbg_init(module_or_path) \{/__wbg_init(module_or_path) \{$'\n\t'module_or_path = module_or_path || $'{};\n\t'module_or_path.module_or_path=Uint8Array.from(atob(\'$WASM_BASE64\'), c=>c.charCodeAt(0))}
-
-          echo "$AUTOGENERATED_SOURCE" > pkg/ep082-bundled.js
-          echo "$AUTOGENERATED_INFO_FUNC" >> pkg/ep082-bundled.js
-
-          # === types transform framework ===
-          AUTOGENERATED_TYPES=$(<"out/ep082_client.d.ts")
-          AUTOGENERATED_TYPES=${AUTOGENERATED_TYPES//$'\n'export interface InitOutput*InitOutput;$'\n'/}
-          AUTOGENERATED_TYPES=${AUTOGENERATED_TYPES//Promise<InitOutput>/Promise<void>}
-
-          echo "$AUTOGENERATED_TYPES" > pkg/ep082.d.ts
-          echo "$AUTOGENERATED_INFO_FUNC_TYPE" >> pkg/ep082.d.ts
-
-          AUTOGENERATED_TYPES=${AUTOGENERATED_TYPES//export type InitInput * WebAssembly.Module;/}
-          AUTOGENERATED_TYPES=${AUTOGENERATED_TYPES//(module_or_path$'?':*Promise<InitInput>):/():}
-          AUTOGENERATED_TYPES=${AUTOGENERATED_TYPES//If $'`'module_or_path* - Passing $'`'InitInput$'`' directly is deprecated./}
-
-          echo "$AUTOGENERATED_TYPES" > pkg/ep082-bundled.d.ts
-          echo "$AUTOGENERATED_INFO_FUNC_TYPE" >> pkg/ep082-bundled.d.ts
-
-          cp out/ep082_client_bg.wasm pkg/ep082.wasm
-
-          echo "Installing global minification toolchain..."
+      - name: Setup Tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq nodejs
           sudo npm install -g terser
 
-          echo "Applying hyper-compressed minification configuration..."
-          # Maximize compression properties without breaking external module interaction contracts
-          TERSER_OPTS="--compress passes=5,ecma=2020,pure_getters=true,unsafe=true,unsafe_arrows=true,unsafe_comps=true,unsafe_math=true,unsafe_methods=true,unsafe_proto=true,unsafe_regexp=true,drop_console=false --mangle toplevel"
+      - name: Install latest compatible Binaryen
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=$(curl -s https://github.com | jq -r .tag_name)
+          URL_PART1="https://github.com"
+          URL_PART2="WebAssembly/binaryen/"
+          URL_PART3="releases/download/"
+          URL_PART4="${TAG}/binaryen-${TAG}"
+          URL_PART5="-x86_64-linux.tar.gz"
+          FULL_URL="${URL_PART1}${URL_PART2}${URL_PART3}${URL_PART4}${URL_PART5}"
+          curl -L "$FULL_URL" | tar -xz
+          sudo cp "binaryen-${TAG}/bin/"* /usr/local/bin/
+
+      - name: Download Artifact Intermediates
+        uses: actions/download-artifact@v4
+        with:
+          name: compiled-wasm-assets
+          path: client/
+
+      - name: Lowering and Optimization Core Cycles
+        working-directory: client
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pkg/
+          WASMOPTFLAGS="-g"
+          [ "$RELEASE" = "1" ] && WASMOPTFLAGS=""
           
-          terser pkg/ep082.js $TERSER_OPTS --output pkg/ep082.js
-          terser pkg/ep082-bundled.js $TERSER_OPTS --output pkg/ep082-bundled.js
+          mv out/ep082_client_bg.wasm out/ep082_client_unoptimized.wasm
+          wasm-opt $WASMOPTFLAGS --signext-lowering out/ep082_client_unoptimized.wasm -o out/ep082_client_lowered.wasm
 
+          if [ "$RELEASE" = "1" ]; then
+            G="--generate-global-effects"
+            wasm-opt --enable-gc --all-features out/ep082_client_lowered.wasm -o out/t1.wasm --converge $G --type-unfinalizing $G --type-ssa $G -O4 $G --flatten $G --rereloop $G -O4 $G -O4 $G --type-merging $G --type-finalizing $G -O4
+            wasm-opt --enable-gc --all-features out/t1.wasm -o out/t2.wasm --converge $G --type-unfinalizing $G --type-ssa $G -Oz $G --flatten $G --rereloop $G -Oz $G -Oz $G --type-merging $G --type-finalizing $G -Oz
+            wasm-opt --enable-gc --all-features out/t2.wasm -o out/t3.wasm $G --abstract-type-refining $G --code-folding $G --const-hoisting $G --dae $G --flatten $G --dfo $G --merge-locals $G --merge-similar-functions --type-finalizing
+            wasm-opt --enable-gc --all-features out/t3.wasm -o out/t4.wasm --converge $G --type-unfinalizing $G --type-ssa $G -O4 $G --flatten $G --rereloop $G -O4 $G -O4 $G --type-merging $G --type-finalizing $G -O4
+            wasm-opt --enable-gc --all-features out/t4.wasm -o out/ep082_client_bg.wasm --converge $G --type-unfinalizing $G --type-ssa $G -Oz $G --flatten $G --rereloop $G -Oz $G -Oz $G --type-merging $G --type-finalizing $G -Oz
+          else
+            mv out/ep082_client_lowered.wasm out/ep082_client_bg.wasm
+          fi
+
+      - name: Transform Sources and Bundles
+        working-directory: client
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION_VAL=$(jq -r '.version // "0.0.0"' package.json)
+          INF="export const info = { version: \"$VERSION_VAL\", minimal: ${MINIMAL}===1, release: ${RELEASE}===1, commit: \"$(git rev-parse HEAD)\" };"
+          INFT="export const info: { version: string, minimal: boolean, release: boolean, commit: string };"
+
+          SRC=$(<"out/ep082_client.js")
+          PTH=$(<"out/ep082_client.js")
+          PTH=${PTH#*\'} && PTH=${PTH%%\'*}
+
+          SNP=$(base64 -w0 "${PTH/#./out}")
+          SRC=${SRC//${PTH}/data:text/javascript$';'base64,${SNP}}
+          SRC=${SRC//maximum:16384,shared:true/maximum:/iPad|iPhone|iPod/.test(navigator.userAgent)?4096:8192,shared:true}
+          SRC=${SRC//'_bg.wasm'/'.wasm'} && SRC=${SRC//'ep082_client.wasm'/'ep082.wasm'}
+          SRC=${SRC//export $'{' initSync $'};\n'/}
+          SRC=${SRC//if (wasm !== undefined) return wasm/if (wasm !== undefined) return}
+          SRC=${SRC//return __wbg_finalize_init/__wbg_finalize_init}
+
+          echo "$SRC" > pkg/ep082.js && echo "$INF" >> pkg/ep082.js
+          W64=$(base64 -w0 out/ep082_client_bg.wasm)
+          BND=${SRC//__wbg_init(module_or_path) \{/__wbg_init(module_or_path) \{$'\n\t'module_or_path = module_or_path || $'{};\n\t'module_or_path.module_or_path=Uint8Array.from(atob(\'$W64\'), c=>c.charCodeAt(0))}
+          echo "$BND" > pkg/ep082-bundled.js && echo "$INF" >> pkg/ep082-bundled.js
+
+          TYP=$(<"out/ep082_client.d.ts")
+          TYP=${TYP//$'\n'export interface InitOutput*InitOutput;$'\n'/} && TYP=${TYP//Promise<InitOutput>/Promise<void>}
+          echo "$TYP" > pkg/ep082.d.ts && echo "$INFT" >> pkg/ep082.d.ts
+
+          BTYP=${TYP//export type InitInput * WebAssembly.Module;/}
+          BTYP=${BTYP//(module_or_path$'?':*Promise<InitInput>):/():}
+          BTYP=${BTYP//If $'`'module_or_path* - Passing $'`'InitInput$'`' directly is deprecated./}
+          echo "$BTYP" > pkg/ep082-bundled.d.ts && echo "$INFT" >> pkg/ep082-bundled.d.ts
+          cp out/ep082_client_bg.wasm pkg/ep082.wasm
+
+      - name: Compress and Ship Packages
+        working-directory: client
+        shell: bash
+        run: |
+          set -euo pipefail
+          T_OPTS="--compress passes=5,ecma=2020,pure_getters=true,unsafe=true,unsafe_arrows=true,unsafe_comps=true,unsafe_math=true,unsafe_methods=true,unsafe_proto=true,unsafe_regexp=true --mangle toplevel"
+          terser pkg/ep082.js $T_OPTS --output pkg/ep082.js
+          terser pkg/ep082-bundled.js $T_OPTS --output pkg/ep082-bundled.js
           rm -rf out/
-          echo "[epx] done!"
 
-      - name: Commit generated pkg directory
+      - name: Commit distribution outputs
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
-          git config user.email \
-            "41898282+github-actions[bot]@://github.com"
-          
+          git config user.email "41898282+github-actions[bot]@://github.com"
           git add -f client/pkg/
-          
           if git diff --cached --quiet; then
-            echo "No changes to pkg; skipping commit."
+            echo "No updates detected."
             exit 0
           fi
-          git commit -m "Build ep082 WebAssembly package"
+          git commit -m "Build ep082 WebAssembly distribution units"
           git push origin "HEAD:${GITHUB_REF_NAME}"
