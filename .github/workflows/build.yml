@@ -95,6 +95,8 @@ jobs:
       - name: Build WebAssembly package
         working-directory: client
         shell: bash
+        env:
+          WASM_BINDGEN_NO_WASM_OPT: 1
         run: |
           set -euo pipefail
           chmod +x build.sh
@@ -102,8 +104,6 @@ jobs:
           # Inject an alias patch before running build.sh to ensure the file exists under the expected name
           mkdir -p ../target/wasm32-unknown-unknown/release
           
-          # Intercept the execution right after cargo build finishes by wrapping build.sh
-          # Or handle it gracefully if build.sh executes cargo inside it
           echo "Compiling and ensuring target alignment..."
           
           # Run the build script
@@ -140,7 +140,7 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email \
-            "41898282+github-actions[bot]@://github.com"
+            "41898282+github-actions[bot]@users.noreply.github.com"
           
           git add -f client/pkg/
           
