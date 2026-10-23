@@ -1,5 +1,5 @@
 [package]
-name = "epoxy-client"
+name = "ep082-client"
 version = "2.1.20"
 edition = "2024"
 
