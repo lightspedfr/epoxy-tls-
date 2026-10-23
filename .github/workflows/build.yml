@@ -106,7 +106,8 @@ jobs:
             CARGOFLAGS=""
           fi
 
-          export CFLAGS='-O3' RUSTFLAGS='-Zlocation-detail=none -C target-cpu=mvp --cfg getrandom_backend="wasm_js"'
+          # Maximize compilation optimization targeting binary size reduction (-Oz style optimization parameters)
+          export CFLAGS='-O3' RUSTFLAGS='-Zlocation-detail=none -C target-cpu=mvp -C opt-level=z --cfg getrandom_backend="wasm_js"'
           
           echo "Compiling via Cargo..."
           cargo build --target wasm32-unknown-unknown -Z build-std=panic_abort,std -Z build-std-features=optimize_for_size --release $CARGOFLAGS
@@ -116,28 +117,17 @@ jobs:
           wasm-bindgen --target web --out-dir out/ ../target/wasm32-unknown-unknown/release/ep082_client.wasm
           echo "[epx] wasm-bindgen finished"
 
-          if [ "$RELEASE" != "1" ]; then
-            WASMOPTFLAGS="-g"
-          else
-            WASMOPTFLAGS=""
-          fi
-
+          # Super-aggressive low-level binary optimization pipeline (Always apply for maximum footprint reduction)
           mv out/ep082_client_bg.wasm out/ep082_client_unoptimized.wasm
-          wasm-opt $WASMOPTFLAGS --signext-lowering out/ep082_client_unoptimized.wasm -o out/ep082_client_lowered.wasm
+          
+          G="--generate-global-effects"
+          echo "Executing hyper-aggressive optimization sequence on binary payload..."
+          wasm-opt --signext-lowering out/ep082_client_unoptimized.wasm -o out/ep082_client_bg.wasm \
+            --converge -Oz \
+            $G --type-unfinalizing $G --type-ssa $G -Oz $G --flatten $G --rereloop $G -Oz $G -Oz $G --type-merging $G --type-finalizing $G -Oz \
+            $G --abstract-type-refining $G --code-folding $G --const-hoisting $G --dae $G --flatten $G --dfo $G --merge-locals $G --merge-similar-functions --type-finalizing \
+            $G --type-unfinalizing $G --type-ssa $G -Oz $G --flatten $G --rereloop $G -Oz $G -Oz $G --type-merging $G --type-finalizing $G -Oz 
 
-          if [ "$RELEASE" = "1" ]; then
-            G="--generate-global-effects"
-            time wasm-opt $WASMOPTFLAGS \
-              out/ep082_client_lowered.wasm -o out/ep082_client_bg.wasm \
-              --converge \
-              $G --type-unfinalizing $G --type-ssa $G -O4 $G --flatten $G --rereloop $G -O4 $G -O4 $G --type-merging $G --type-finalizing $G -O4 \
-              $G --type-unfinalizing $G --type-ssa $G -Oz $G --flatten $G --rereloop $G -Oz $G -Oz $G --type-merging $G --type-finalizing $G -Oz \
-              $G --abstract-type-refining $G --code-folding $G --const-hoisting $G --dae $G --flatten $G --dfo $G --merge-locals $G --merge-similar-functions --type-finalizing \
-              $G --type-unfinalizing $G --type-ssa $G -O4 $G --flatten $G --rereloop $G -O4 $G -O4 $G --type-merging $G --type-finalizing $G -O4 \
-              $G --type-unfinalizing $G --type-ssa $G -Oz $G --flatten $G --rereloop $G -Oz $G -Oz $G --type-merging $G --type-finalizing $G -Oz 
-          else
-            mv out/ep082_client_lowered.wasm out/ep082_client_bg.wasm
-          fi
           echo "[epx] wasm-opt finished"
 
           # === js transform framework ===
@@ -192,9 +182,12 @@ jobs:
           echo "Installing global minification toolchain..."
           sudo npm install -g terser
 
-          echo "Minifying JavaScript files..."
-          terser pkg/ep082.js --mangle toplevel --compress passes=2 --output pkg/ep082.js
-          terser pkg/ep082-bundled.js --mangle toplevel --compress passes=2 --output pkg/ep082-bundled.js
+          echo "Applying hyper-compressed minification configuration..."
+          # Maximize compression properties without breaking external module interaction contracts
+          TERSER_OPTS="--compress passes=5,ecma=2020,pure_getters=true,unsafe=true,unsafe_arrows=true,unsafe_comps=true,unsafe_math=true,unsafe_methods=true,unsafe_proto=true,unsafe_regexp=true,drop_console=false --mangle toplevel"
+          
+          terser pkg/ep082.js $TERSER_OPTS --output pkg/ep082.js
+          terser pkg/ep082-bundled.js $TERSER_OPTS --output pkg/ep082-bundled.js
 
           rm -rf out/
           echo "[epx] done!"
