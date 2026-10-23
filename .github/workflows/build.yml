@@ -69,19 +69,28 @@ jobs:
             -e 's/Epoxy/Ep082/g'
 
       - name: Install matching wasm-bindgen CLI if specified
-        working-directory: client
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="$(grep -A5 -E '^name = "wasm-bindgen"$' Cargo.lock | grep -m1 '^version = ' | cut -d '"' -f2 || true)"
+          # Check client directory first, fallback to root directory
+          if [ -f "client/Cargo.lock" ]; then
+            LOCKFILE="client/Cargo.lock"
+          elif [ -f "Cargo.lock" ]; then
+            LOCKFILE="Cargo.lock"
+          else
+            echo "No Cargo.lock found."
+            exit 0
+          fi
+
+          VERSION="$(grep -A5 -E '^name = "wasm-bindgen"$' "$LOCKFILE" | grep -m1 '^version = ' | cut -d '"' -f2 || true)"
           if [ -n "$VERSION" ]; then
-            echo "Using wasm-bindgen CLI version $VERSION"
+            echo "Using wasm-bindgen CLI version $VERSION from $LOCKFILE"
             cargo install wasm-bindgen-cli \
               --version "$VERSION" \
               --locked \
               --force
           else
-            echo "No wasm-bindgen version found in Cargo.lock."
+            echo "No wasm-bindgen version found in $LOCKFILE."
           fi
 
       - name: Build WebAssembly package
