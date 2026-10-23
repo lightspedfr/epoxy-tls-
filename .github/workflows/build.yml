@@ -141,6 +141,11 @@ jobs:
           echo "$RUNNER_TEMP/binaryen/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/binaryen/bin/wasm-opt" --version
 
+      - name: Set up Node.js (for Terser)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Download Intermediates
         uses: actions/download-artifact@v4
         with:
@@ -229,6 +234,27 @@ jobs:
 
           cp out/ep082_client_bg.wasm pkg/ep082.wasm
           rm -rf out/
+
+      - name: Minify JavaScript
+        working-directory: client
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Property names are deliberately NOT mangled: the wasm import object
+          # is keyed by __wbg_* names that the .wasm binary looks up by string.
+          COMPRESS='passes=5,toplevel=true,module=true,ecma=2020,pure_getters=true,hoist_funs=true,booleans_as_integers=false,unsafe=true,unsafe_arrows=true,unsafe_comps=true,unsafe_math=true,unsafe_methods=true,unsafe_proto=true,unsafe_regexp=true,unsafe_undefined=true,drop_console=false'
+          for f in pkg/ep082.js pkg/ep082-bundled.js; do
+            BEFORE=$(stat -c%s "$f")
+            npx --yes terser@5 "$f" \
+              --module \
+              --ecma 2020 \
+              --compress "$COMPRESS" \
+              --mangle toplevel=true \
+              --format comments=false,ascii_only=false,wrap_func_args=false \
+              --output "$f.min"
+            mv "$f.min" "$f"
+            echo "$f: $BEFORE -> $(stat -c%s "$f") bytes"
+          done
 
       - name: Commit distribution outputs
         # A manual run from a tag has no branch to push to.
