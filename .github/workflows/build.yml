@@ -1,0 +1,126 @@
+name: Build ep082 WASM
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ep082-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            jq \
+            git \
+            binaryen \
+            build-essential \
+            pkg-config
+
+      - name: Install Rust nightly and WebAssembly target
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --locked
+
+      - name: Rename epoxy source references to ep082
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Rename lowercase and capitalized source references.
+          # Exclude Cargo manifests and lockfiles to preserve
+          # external dependency names and dependency resolution.
+          git grep -Ilz -E 'epoxy|Epoxy' -- \
+            '*.rs' \
+            '*.js' \
+            '*.mjs' \
+            '*.cjs' \
+            '*.ts' \
+            '*.sh' \
+            '*.html' \
+            '*.css' \
+            '*.json' \
+            '*.yml' \
+            '*.yaml' \
+            '*.toml' \
+            ':!**/Cargo.toml' \
+            ':!**/Cargo.lock' \
+            ':!README*' \
+            ':!LICENSE*' \
+            ':!**/pkg/**' \
+          | xargs -0 -r sed -i \
+            -e 's/epoxy/ep082/g' \
+            -e 's/Epoxy/Ep082/g'
+
+      - name: Install matching wasm-bindgen CLI if specified
+        working-directory: client
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -A5 -E '^name = "wasm-bindgen"$' Cargo.lock \
+            | grep -m1 '^version = ' \
+
+            | cut -d '"' -f2 || true)"
+          if [ -n "$VERSION" ]; then
+            echo "Using wasm-bindgen CLI version $VERSION"
+            cargo install wasm-bindgen-cli \
+              --version "$VERSION" \
+              --locked \
+              --force
+          else
+            echo "No wasm-bindgen version found in Cargo.lock."
+          fi
+
+      - name: Build WebAssembly package
+        working-directory: client
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x build.sh
+          bash build.sh
+          if [ ! -d pkg ]; then
+            echo "::error::Build did not create the pkg directory."
+            exit 1
+          fi
+          if [ -z "$(find pkg -type f -print -quit)" ]; then
+            echo "::error::The pkg directory is empty."
+            exit 1
+          fi
+          echo "Generated package:"
+          find pkg -maxdepth 3 -type f -print
+
+      - name: Commit generated pkg directory
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # Git add the package generated inside the client directory
+          git add -f client/pkg/
+          
+          if git diff --cached --quiet; then
+            echo "No changes to pkg; skipping commit."
+            exit 0
+          fi
+          git commit -m "Build ep082 WebAssembly package"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
