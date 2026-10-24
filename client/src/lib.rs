@@ -751,7 +751,10 @@ impl EpoxyClient {
 		let raw_headers = Object::new();
 		for (k, v) in &response_headers_raw {
 			let k = k.as_str();
-			let v: JsValue = v.to_str()?.to_string().into();
+			// Skip a header whose value isn't visible ASCII rather than failing the
+			// whole response; a stray byte must never drop every Set-Cookie with it.
+			let Ok(v) = v.to_str() else { continue };
+			let v: JsValue = v.to_string().into();
 			let jv = object_get(&raw_headers, k);
 			if jv.is_array() {
 				let arr = Array::from(&jv);
